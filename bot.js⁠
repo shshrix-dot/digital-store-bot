@@ -1,0 +1,200 @@
+import { Telegraf, Markup } from 'telegraf';
+import axios from 'axios';
+import { Low } from 'lowdb';
+import { JSONFile } from 'lowdb/node';
+import NodeCache from 'node-cache';
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+const bot = new Telegraf(process.env.BOT_TOKEN);
+const ADMIN_ID = process.env.ADMIN_ID;
+const BASE_URL = process.env.SUPPLIER_BASE_URL || 'https://ventetelegrambotrailway-production.up.railway.app';
+const API_KEY = process.env.SUPPLIER_API_KEY;
+const PROFIT_PERCENT = parseFloat(process.env.PROFIT_PERCENT || '30');
+
+const cache = new NodeCache({ stdTTL: 180 });
+
+// ডাটাবেজ
+const adapter = new JSONFile('database.json');
+const db = new Low(adapter, { users: {} });
+await db.read();
+db.data ||= { users: {} };
+
+function ensureUser(id) {
+  if (!db.data.users[id]) {
+    db.data.users[id] = { balance: 0.00 };
+  }
+}
+
+// সাপ্লায়ার ক্লায়েন্ট
+const supplier = axios.create({
+  baseURL: BASE_URL,
+  headers: {
+    'Authorization': `Bearer ${API_KEY}`,
+    'X-API-Key': API_KEY,
+    'Content-Type': 'application/json'
+  },
+  timeout: 15000
+});
+
+// লাইভ প্রোডাক্ট ফেচ
+async function fetchSupplierProducts() {
+  const cached = cache.get('products');
+  if (cached) return cached;
+
+  try {
+    const res = await supplier.get('/api/products');
+    const products = Array.isArray(res.data) ? res.data : (res.data.products || res.data.data || []);
+    cache.set('products', products);
+    return products;
+  } catch (err) {
+    console.error('Error fetching supplier products:', err.message);
+    return [];
+  }
+}
+
+// কিবোর্ড তৈরি
+async function getStoreKeyboard() {
+  const products = await fetchSupplierProducts();
+  const keyboard = [];
+
+  keyboard.push([Markup.button.callback('💥 Claude AI ▸ Plans »', 'cat_ai')]);
+  keyboard.push([Markup.button.callback('🤖 ChatGPT & Codex »', 'cat_ai')]);
+
+  if (products.length > 0) {
+    products.slice(0, 15).forEach((p) => {
+      const originalPrice = parseFloat(p.price || p.cost || 0);
+      const sellPrice = (originalPrice * (1 + PROFIT_PERCENT / 100)).toFixed(2);
+      const stock = p.stock ?? p.quantity ?? (p.is_available ? '10+' : 0);
+      const statusIcon = stock > 0 ? '🟢' : '🔴';
+
+      const label = `${(p.name \vert{}\vert{} p.title).substring(0, 26)} \vert{}$${sellPrice} | ${statusIcon}${stock}`;
+      keyboard.push([Markup.button.callback(label, `buy_${p.id}`)]);
+    });
+  } else {
+    keyboard.push([Markup.button.callback('Emails Outlook/hotmail | $0.02 | 🟢 1000+', 'buy_outlook_default')]);
+    keyboard.push([Markup.button.callback('Gmails Accounts | $0.65 | 🟢 50', 'buy_gmail_default')]);
+  }
+
+  keyboard.push([
+    Markup.button.callback('💳 Add Balance', 'add_funds'),
+    Markup.button.callback('👤 My Account', 'my_account')
+  ]);
+
+  return Markup.inlineKeyboard(keyboard);
+}
+
+// /start
+bot.start(async (ctx) => {
+  ensureUser(ctx.from.id);
+  await db.write();
+
+  const user = db.data.users[ctx.from.id];
+  const keyboard = await getStoreKeyboard();
+
+  return ctx.reply(
+    `📦 **Select the product you need:**\n\n💰 Your Balance: **$${user.balance.toFixed(2)}**`,
+    { parse_mode: 'Markdown', ...keyboard }
+  );
+});
+
+// অর্ডার প্রসেস
+bot.action(/buy_(.+)/, async (ctx) => {
+  const productId = ctx.match[1];
+  const userId = ctx.from.id;
+  ensureUser(userId);
+  const user = db.data.users[userId];
+
+  const products = await fetchSupplierProducts();
+  const product = products.find(p => String(p.id) === String(productId));
+
+  const cost = product ? parseFloat(product.price || product.cost || 0) * (1 + PROFIT_PERCENT / 100) : 0.02;
+
+  if (user.balance < cost) {
+    return ctx.answerCbQuery(`❌ Insufficient balance! Price: $${cost.toFixed(2)}, You have:$${user.balance.toFixed(2)}`, { show_alert: true });
+  }
+
+  await ctx.answerCbQuery('Processing order with supplier...');
+  await ctx.reply('⏳ Connecting to supplier & delivering credentials...');
+
+  try {
+    const orderRes = await supplier.post('/api/orders', {
+      product_id: productId,
+      quantity: 1
+    });
+
+    const deliveryData = orderRes.data.data || orderRes.data.account || orderRes.data.license || JSON.stringify(orderRes.data);
+
+    user.balance -= cost;
+    await db.write();
+
+    return ctx.reply(
+      `✅ **Order Completed Successfully!**\n\n` +
+      `📦 **Item:** ${product ? product.name : 'Account'}\n` +
+      `🔑 **Data:**\n\`${deliveryData}\`\n\n` +
+      `💰 Remaining Balance: $${user.balance.toFixed(2)}`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (err) {
+    console.error('Supplier Order Error:', err.message);
+    const msg = err.response?.data?.message || 'Out of stock or supplier wallet empty!';
+    return ctx.reply(`⚠️ Order Failed: ${msg}\nYour balance has not been deducted.`);
+  }
+});
+
+// ডিপোজিট
+bot.action('add_funds', (ctx) => {
+  return ctx.reply(
+    `💳 **Add Balance / Deposit**\n\n` +
+    `📱 **bKash (Send Money):** \`${process.env.BKASH_NUMBER || '01XXXXXXXXX'}\` ($1 = 125 BDT)\n` +
+    `🌐 **USDT (TRC20):** \`${process.env.CRYPTO_WALLET || 'WALLET_ADDRESS'}\`\n\n` +
+    `টাকা পাঠিয়ে মেসেজ দিন:\n` +
+    `👉 \`/pay <TrxID> <USD_Amount>\`\n\n` +
+    `*উদাহরণ:* \`/pay 9H38DAX1 5\``,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.command('pay', async (ctx) => {
+  const parts = ctx.message.text.split(' ');
+  if (parts.length < 3) return ctx.reply('Format: `/pay <TrxID> <Amount>`', { parse_mode: 'Markdown' });
+
+  const trxId = parts[1];
+  const amount = parseFloat(parts[2]);
+  const userId = ctx.from.id;
+
+  await bot.telegram.sendMessage(
+    ADMIN_ID,
+    `🔔 **New Payment Submitted!**\n\n👤 User: ${ctx.from.first_name} (\`${userId}\`)\n💵 Amount: $${amount.toFixed(2)}\n🆔 TrxID: \`${trxId}\``,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback(`✅ Approve ($${amount})`, `approve_${userId}_${amount}`)]
+      ])
+    }
+  );
+
+  return ctx.reply('✅ Payment submitted! It will be verified and added to your wallet shortly.');
+});
+
+bot.action(/approve_(\d+)_(.+)/, async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_ID.toString()) return;
+  const targetId = ctx.match[1];
+  const amount = parseFloat(ctx.match[2]);
+
+  ensureUser(targetId);
+  db.data.users[targetId].balance += amount;
+  await db.write();
+
+  await ctx.editMessageText(`✅ Approved $${amount.toFixed(2)} for ${targetId}`);
+  return bot.telegram.sendMessage(targetId, `🎉 $${amount.toFixed(2)} has been added to your balance!`);
+});
+
+bot.action('my_account', (ctx) => {
+  ensureUser(ctx.from.id);
+  const user = db.data.users[ctx.from.id];
+  return ctx.reply(`👤 **My Account**\n\n🆔 User ID: \`${ctx.from.id}\`\n💰 Balance: $${user.balance.toFixed(2)}`, { parse_mode: 'Markdown' });
+});
+
+bot.launch().then(() => console.log('🚀 Your Auto-Reseller Bot is LIVE!'));
